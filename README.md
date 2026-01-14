@@ -137,3 +137,113 @@ Run edge case tests:
 ```bash
 node testEdgeCasesRaceConditionsRequest.js
 ```
+
+## Analytics & Monitoring
+
+### Core Requirements
+
+- Track rate limit hits per endpoint/tier/region
+- Implement slow-start for new users (gradually increase limits)
+- Add optional logging for security review
+
+### Implementation Details
+
+#### 1. Analytics Tracking
+
+**Tracks metrics per endpoint/tier/region combination:**
+
+```javascript
+{
+  endpoint: '/api/search',
+  tier: 'free',
+  countryCode: 'US',
+  allowed: 150,
+  denied: 50,
+  totalRequests: 200,
+  allowRate: '75.00%'
+}
+```
+
+**Capabilities:**
+
+- Real-time hit counting
+- Allow/deny rate calculations
+- Aggregated reporting by endpoint, tier, and region
+- Identifies bottlenecks and abuse patterns
+
+#### 2. Slow-Start for New Users
+
+**Gradual capacity increase to detect and mitigate fraud:**
+
+```javascript
+// Default configuration
+slowStart: {
+  enabled: true,
+  duration: 86400,        // 24 hours
+  stages: [0.3, 0.6, 1.0] // 30%, 60%, 100%
+}
+```
+
+**Timeline Example:**
+
+- Hours 0-8: User gets 30% of normal limits
+- Hours 8-16: User gets 60% of normal limits
+- Hours 16-24: User gets 100% of normal limits
+
+**Benefits:**
+
+- Detects unusual behavior early
+- Limits fraud damage for compromised accounts
+- Gradually builds trust for legitimate users
+- Reduces sudden spike abuse
+
+#### 3. Security Logging
+
+**Optional audit trail for compliance and investigation:**
+
+```javascript
+// Enable logging
+const limiter = new RateLimiter(redis, { loggingEnabled: true });
+
+// Events captured:
+// - new_user: User enters slow-start
+// - rate_limit_exceeded: Request denied due to limit
+// - configuration_change: Rate limits updated
+```
+
+**Log Format:**
+
+```javascript
+{
+  timestamp: "2025-01-14T10:30:45.123Z",
+  type: "rate_limit_exceeded",
+  userId: "user_123",
+  endpoint: "/api/checkout",
+  tier: "free",
+  countryCode: "US"
+}
+```
+
+**Query Capabilities:**
+
+```javascript
+// Get all events
+limiter.getSecurityLog();
+
+// Filter by user
+limiter.getSecurityLog({ userId: 'user_123' });
+
+// Filter by event type
+limiter.getSecurityLog({ type: 'rate_limit_exceeded' });
+
+// Filter by time range
+limiter.getSecurityLog({ startTime: '2025-01-14T10:00:00Z' });
+```
+
+### Test Coverage
+
+Run analytics & monitoring tests:
+
+```bash
+node testAnalyticsMonitoring.js
+```

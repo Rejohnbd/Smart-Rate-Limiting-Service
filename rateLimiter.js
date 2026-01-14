@@ -1,10 +1,182 @@
 const { RATE_LIMITS, GEO_LIMITS } = require('./configuration');
 
 class RateLimiter {
-  constructor(redisClient) {
+  constructor(redisClient, options = {}) {
     this.redis = redisClient;
     this.config = RATE_LIMITS;
     this.geoMultipliers = GEO_LIMITS;
+
+    // Analytics & Monitoring
+    this.analytics = {
+      hits: new Map(), // Track rate limit hits per endpoint/tier/region
+      slowStart: new Map(), // Track new user progression
+    };
+
+    // Logging
+    this.logging = {
+      enabled: options.loggingEnabled || false,
+      events: [], // Store security events
+      maxEvents: options.maxLogEvents || 1000,
+    };
+
+    // Slow-start configuration
+    this.slowStart = {
+      enabled: options.slowStartEnabled !== false,
+      duration: options.slowStartDuration || 86400, // 24 hours in seconds
+      stages: options.slowStartStages || [0.3, 0.6, 1.0], // 30%, 60%, 100% of normal limits
+    };
+  }
+
+  // Log security event
+  logSecurityEvent(event) {
+    if (!this.logging.enabled) return;
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      ...event,
+    };
+
+    this.logging.events.push(logEntry);
+
+    // Keep only recent events
+    if (this.logging.events.length > this.logging.maxEvents) {
+      this.logging.events.shift();
+    }
+  }
+
+  // Track analytics hit
+  recordAnalyticsHit(userId, endpoint, tier, countryCode, allowed) {
+    const key = `${endpoint}:${tier}:${countryCode}`;
+
+    if (!this.analytics.hits.has(key)) {
+      this.analytics.hits.set(key, {
+        endpoint,
+        tier,
+        countryCode,
+        allowed: 0,
+        denied: 0,
+        totalRequests: 0,
+      });
+    }
+
+    const stat = this.analytics.hits.get(key);
+    stat.totalRequests++;
+    if (allowed) {
+      stat.allowed++;
+    } else {
+      stat.denied++;
+    }
+  }
+
+  // Get slow-start multiplier for new users
+  async getSlowStartMultiplier(userId, endpoint) {
+    if (!this.slowStart.enabled) return 1.0;
+
+    const userKey = `slowstart:${userId}:${endpoint}`;
+
+    try {
+      const createdAt = await this.redis.get(userKey);
+
+      // New user - set creation time
+      if (!createdAt) {
+        await this.redis.setex(
+          userKey,
+          this.slowStart.duration,
+          Math.floor(Date.now() / 1000)
+        );
+        // Log new user
+        this.logSecurityEvent({
+          type: 'new_user',
+          userId,
+          endpoint,
+          action: 'slow_start_initialized',
+        });
+        return this.slowStart.stages[0]; // Start at first stage
+      }
+
+      // Calculate user age
+      const now = Math.floor(Date.now() / 1000);
+      const userAge = now - parseInt(createdAt);
+      const stageDuration =
+        this.slowStart.duration / this.slowStart.stages.length;
+
+      // Determine which stage
+      let stage = 0;
+      for (let i = 0; i < this.slowStart.stages.length; i++) {
+        if (userAge >= stageDuration * (i + 1)) {
+          stage = i + 1;
+        } else {
+          break;
+        }
+      }
+
+      stage = Math.min(stage, this.slowStart.stages.length - 1);
+      return this.slowStart.stages[stage];
+    } catch (error) {
+      console.error('Slow-start calculation error:', error);
+      return 1.0; // Fail open
+    }
+  }
+
+  // Get analytics report
+  getAnalyticsReport() {
+    const report = {
+      timestamp: new Date().toISOString(),
+      summary: {
+        totalEndpoints: 0,
+        totalRequests: 0,
+        totalAllowed: 0,
+        totalDenied: 0,
+        allowRate: 0,
+      },
+      endpoints: [],
+    };
+
+    for (const [key, stat] of this.analytics.hits.entries()) {
+      report.endpoints.push({
+        ...stat,
+        allowRate:
+          stat.totalRequests > 0
+            ? ((stat.allowed / stat.totalRequests) * 100).toFixed(2) + '%'
+            : 'N/A',
+      });
+
+      report.summary.totalRequests += stat.totalRequests;
+      report.summary.totalAllowed += stat.allowed;
+      report.summary.totalDenied += stat.denied;
+    }
+
+    report.summary.totalEndpoints = this.analytics.hits.size;
+    report.summary.allowRate =
+      report.summary.totalRequests > 0
+        ? (
+            (report.summary.totalAllowed / report.summary.totalRequests) *
+            100
+          ).toFixed(2) + '%'
+        : 'N/A';
+
+    return report;
+  }
+
+  // Get security log
+  getSecurityLog(filter = {}) {
+    let logs = [...this.logging.events];
+
+    if (filter.userId) {
+      logs = logs.filter((e) => e.userId === filter.userId);
+    }
+
+    if (filter.type) {
+      logs = logs.filter((e) => e.type === filter.type);
+    }
+
+    if (filter.startTime) {
+      logs = logs.filter(
+        (e) => new Date(e.timestamp) >= new Date(filter.startTime)
+      );
+    }
+
+    return logs;
   }
 
   async checkLimit(userId, endpoint, tier, countryCode) {
@@ -26,8 +198,16 @@ class RateLimiter {
       const geoConfig =
         this.geoMultipliers[countryCode] || this.geoMultipliers.DEFAULT;
       const geoMultiplier = geoConfig.multiplier;
-      const adjustedMax = Math.floor(endpointConfig.max * geoMultiplier);
-      const adjustedBurst = Math.floor(endpointConfig.burst * geoMultiplier);
+      let adjustedMax = Math.floor(endpointConfig.max * geoMultiplier);
+      let adjustedBurst = Math.floor(endpointConfig.burst * geoMultiplier);
+
+      // Apply slow-start multiplier for new users
+      const slowStartMultiplier = await this.getSlowStartMultiplier(
+        userId,
+        endpoint
+      );
+      adjustedMax = Math.floor(adjustedMax * slowStartMultiplier);
+      adjustedBurst = Math.floor(adjustedBurst * slowStartMultiplier);
 
       const now = Math.floor(Date.now() / 1000);
       const window = endpointConfig.window;
@@ -87,6 +267,9 @@ class RateLimiter {
           const [allowedFlag, remaining, count] = result;
           const allowed = allowedFlag === 1;
 
+          // Record analytics
+          this.recordAnalyticsHit(userId, endpoint, tier, countryCode, allowed);
+
           if (allowed) {
             return {
               allowed: true,
@@ -94,6 +277,16 @@ class RateLimiter {
               retryAfter: 0,
             };
           } else {
+            // Log rate limit denial for security review
+            this.logSecurityEvent({
+              type: 'rate_limit_exceeded',
+              userId,
+              endpoint,
+              tier,
+              countryCode,
+              slowStartMultiplier,
+            });
+
             // Calculate retry time
             let retryAfter = 0;
             const tokens = parseFloat(await this.redis.get(tokenKey)) || 0;
