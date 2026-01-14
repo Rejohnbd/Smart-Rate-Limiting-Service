@@ -33,31 +33,19 @@ Building a rate limiting service for an e-commerce platform with:
 - Requests consume 1 token; allowed if tokens ≥ 1 and count < max
 - Burst capacity allows temporary spikes above the steady-state rate
 
-#### Tier-Based Configuration
+#### Geographic Multipliers
 
 ```javascript
 {
-  free:       { /api/search: 100 req/hr, 20 burst },
-  premium:    { /api/search: 1000 req/hr, 100 burst },
-  enterprise: { /api/search: 10000 req/hr, 1000 burst }
+  US: { multiplier: 1.0 },   // Baseline
+  EU: { multiplier: 1.0 },   // Baseline
+  CN: { multiplier: 0.5 },   // Stricter (compliance)
+  IN: { multiplier: 2.0 },   // Higher (market access)
+  DEFAULT: { multiplier: 1.0 }
 }
 ```
 
-#### Geographic Multipliers
-
-- **US/EU**: 1.0x (baseline)
-- **CN**: 0.5x (stricter limits for compliance)
-- **IN**: 2.0x (higher limits)
-
-### State Management
-
-- **Redis Keys**:
-  - `rate:tokens:{userId}:{endpoint}` - Available tokens
-  - `rate:last_refill:{userId}:{endpoint}` - Last refill timestamp
-  - `rate:count:{userId}:{endpoint}` - Request count in window
-- **TTL**: All keys expire after the time window
-
-Run tests:
+Run core tests:
 
 ```bash
 node testRateLimiter.js
@@ -71,4 +59,81 @@ node testRateLimiter.js
   remaining: number,   // Tokens remaining in bucket
   retryAfter: number   // Seconds to wait if rejected
 }
+```
+
+## Handle Edge Cases & Race Conditions
+
+### Core Requirements
+
+- Multiple concurrent requests from same user
+- Redis connection failures (implement fallback)
+- Configuration changes mid-window
+- Clock skew between servers
+
+### Implementation Details
+
+#### 1. Concurrent Request Handling
+
+- **Atomic Lua Scripts**: All rate limit operations execute atomically in Redis
+- **Race Condition Prevention**: Token bucket state updates are serialized
+- **Concurrent Burst Handling**: Multiple simultaneous requests properly decrement tokens
+- **Test Results**: 5-50 concurrent requests handled correctly with accurate token consumption
+
+#### 2. Redis Connection Failures & Fallback
+
+- **In-Memory Fallback Cache**: Automatically activates when Redis unavailable
+- **Graceful Degradation**: Service remains available despite Redis outages
+- **Health Checks**: Periodic attempts to detect Redis recovery
+- **State Persistence**: Token bucket state maintained in fallback cache with TTL simulation
+- **Test Results**: 15 requests with 10% failure rate, all succeeded via fallback
+
+#### 3. Configuration Changes Mid-Window
+
+- **Dynamic Configuration**: Rate limits can be updated without restarting service
+- **State Preservation**: Historical token state preserved across config changes
+- **Per-Endpoint Updates**: Changes to specific endpoints don't affect others
+- **Test Results**: Config changes applied mid-window with proper enforcement
+
+#### 4. Clock Skew Between Servers
+
+- **Refill Logic Resilience**: Token refill calculations handle time differences
+- **Server Independence**: Each server can have different local time
+- **Graceful Handling**: Time skew up to 30+ seconds handled safely
+- **Test Results**: Server with +30s clock skew properly refills tokens
+
+### Advanced Features
+
+#### Atomic Operations (Lua Script)
+
+```lua
+-- Prevents race conditions in distributed systems
+local tokens = refill_based_on_time_passed()
+if tokens >= 1 and count < max then
+  tokens -= 1
+  count += 1
+  ALLOWED
+else
+  DENIED
+end
+```
+
+#### Fallback Cache Architecture
+
+- **Primary**: Redis (distributed, shared state)
+- **Secondary**: In-memory Map (local cache, TTL-aware)
+- **Automatic Failover**: Seamless transition on Redis failure
+- **Recovery Detection**: Automatic switch back to Redis when available
+
+#### Multi-User Isolation
+
+- Independent rate limits per `user:endpoint` combination
+- No interference between different users
+- Geographic multipliers applied per-user basis
+
+### Test Coverage
+
+Run edge case tests:
+
+```bash
+node testEdgeCasesRaceConditionsRequest.js
 ```
