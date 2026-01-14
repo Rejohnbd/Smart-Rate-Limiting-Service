@@ -14,6 +14,11 @@ const RATE_LIMITS = {
     '/api/checkout': { window: 3600, max: 1000, burst: 200 },
     '/api/profile': { window: 3600, max: 1000, burst: 200 },
   },
+  unlimited: {
+    '/api/search': { window: 3600, max: Infinity, burst: Infinity },
+    '/api/checkout': { window: 3600, max: Infinity, burst: Infinity },
+    '/api/profile': { window: 3600, max: Infinity, burst: Infinity },
+  },
 };
 
 const GEO_LIMITS = {

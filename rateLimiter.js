@@ -25,6 +25,43 @@ class RateLimiter {
       duration: options.slowStartDuration || 86400, // 24 hours in seconds
       stages: options.slowStartStages || [0.3, 0.6, 1.0], // 30%, 60%, 100% of normal limits
     };
+
+    // Optimization: local cache to reduce Redis calls
+    this.localCache = new Map(); // Cache: key -> { value, ttl }
+    this.cacheEnabled = options.cacheEnabled !== false;
+    this.cacheTTL = options.cacheTTL || 1000; // 1 second cache TTL
+
+    // Request cost tracking
+    this.costEnabled = options.costEnabled !== false;
+  }
+
+  // Optimization: Local cache management
+  getFromCache(key) {
+    if (!this.cacheEnabled) return null;
+    const cached = this.localCache.get(key);
+    if (!cached) return null;
+    if (cached.ttl < Date.now()) {
+      this.localCache.delete(key);
+      return null;
+    }
+    return cached.value;
+  }
+
+  setInCache(key, value) {
+    if (!this.cacheEnabled) return;
+    this.localCache.set(key, {
+      value,
+      ttl: Date.now() + this.cacheTTL,
+    });
+  }
+
+  // Clear cache for a user (when tier changes)
+  clearUserCache(userId) {
+    for (const key of this.localCache.keys()) {
+      if (key.includes(userId)) {
+        this.localCache.delete(key);
+      }
+    }
   }
 
   // Log security event
@@ -179,8 +216,17 @@ class RateLimiter {
     return logs;
   }
 
-  async checkLimit(userId, endpoint, tier, countryCode) {
+  async checkLimit(userId, endpoint, tier, countryCode, requestCost = 1) {
     try {
+      // Optimization: Check cache first (except for unlimited tier)
+      const cacheKey = `check:${userId}:${endpoint}:${tier}`;
+      if (tier !== 'unlimited') {
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+          return cached;
+        }
+      }
+
       // Get base configuration
       const tierConfig = this.config[tier];
       if (!tierConfig) {
@@ -191,6 +237,12 @@ class RateLimiter {
       const endpointConfig = this.config[tier][endpoint];
       if (!endpointConfig) {
         // No rate limit for this endpoint
+        return { allowed: true, remaining: Infinity, retryAfter: 0 };
+      }
+
+      // OPTIMIZATION: Unlimited tier bypass - no Redis call needed
+      if (tier === 'unlimited') {
+        this.recordAnalyticsHit(userId, endpoint, tier, countryCode, true);
         return { allowed: true, remaining: Infinity, retryAfter: 0 };
       }
 
@@ -217,8 +269,8 @@ class RateLimiter {
       const lastRefillKey = `rate:last_refill:${userId}:${endpoint}`;
       const countKey = `rate:count:${userId}:${endpoint}`;
 
-      // Atomic Lua script to prevent race conditions
-      // This is executed atomically in Redis
+      // OPTIMIZATION: Lua script updated to handle request cost
+      // This is executed atomically in Redis - single call reduces overhead
       const luaScript = `
         local tokenKey = KEYS[1]
         local lastRefillKey = KEYS[2]
@@ -227,6 +279,7 @@ class RateLimiter {
         local adjustedMax = tonumber(ARGV[2])
         local adjustedBurst = tonumber(ARGV[3])
         local window = tonumber(ARGV[4])
+        local cost = tonumber(ARGV[5])
         
         local tokens = tonumber(redis.call('GET', tokenKey)) or adjustedBurst
         local lastRefill = tonumber(redis.call('GET', lastRefillKey)) or now
@@ -236,11 +289,11 @@ class RateLimiter {
         local refillAmount = (timePassed * adjustedMax) / window
         tokens = math.min(adjustedBurst, tokens + refillAmount)
         
-        local allowed = tokens >= 1 and count < adjustedMax
+        local allowed = tokens >= cost and count < adjustedMax
         
         if allowed then
-          tokens = tokens - 1
-          count = count + 1
+          tokens = tokens - cost
+          count = count + cost
         end
         
         redis.call('SETEX', tokenKey, window, tostring(tokens))
@@ -260,7 +313,8 @@ class RateLimiter {
           now,
           adjustedMax,
           adjustedBurst,
-          window
+          window,
+          requestCost
         );
 
         if (result) {
@@ -270,12 +324,16 @@ class RateLimiter {
           // Record analytics
           this.recordAnalyticsHit(userId, endpoint, tier, countryCode, allowed);
 
+          // Cache the result for optimization (except denials)
           if (allowed) {
-            return {
+            const response = {
               allowed: true,
               remaining: remaining,
               retryAfter: 0,
+              cost: requestCost,
             };
+            this.setInCache(cacheKey, response);
+            return response;
           } else {
             // Log rate limit denial for security review
             this.logSecurityEvent({
@@ -285,21 +343,24 @@ class RateLimiter {
               tier,
               countryCode,
               slowStartMultiplier,
+              requestCost,
             });
 
             // Calculate retry time
             let retryAfter = 0;
             const tokens = parseFloat(await this.redis.get(tokenKey)) || 0;
-            if (tokens < 1) {
-              const tokensNeeded = 1 - tokens;
+            if (tokens < requestCost) {
+              const tokensNeeded = requestCost - tokens;
               const secondsPerToken = window / adjustedMax;
               retryAfter = Math.ceil(tokensNeeded * secondsPerToken);
             }
 
             return {
               allowed: false,
+              allowed: false,
               remaining: 0,
               retryAfter: Math.max(retryAfter, 1),
+              cost: requestCost,
             };
           }
         }
@@ -317,7 +378,8 @@ class RateLimiter {
           now,
           window,
           adjustedMax,
-          adjustedBurst
+          adjustedBurst,
+          requestCost
         );
       }
     } catch (error) {
@@ -339,7 +401,8 @@ class RateLimiter {
     now,
     window,
     adjustedMax,
-    adjustedBurst
+    adjustedBurst,
+    requestCost = 1
   ) {
     try {
       // Get current values from Redis
@@ -365,11 +428,11 @@ class RateLimiter {
       const refillAmount = (timePassed * adjustedMax) / window;
       tokens = Math.min(adjustedBurst, tokens + refillAmount);
 
-      // Check if request is allowed
-      if (tokens >= 1 && count < adjustedMax) {
-        // Consume one token
-        tokens -= 1;
-        count += 1;
+      // Check if request is allowed (with cost)
+      if (tokens >= requestCost && count < adjustedMax) {
+        // Consume tokens based on request cost
+        tokens -= requestCost;
+        count += requestCost;
 
         try {
           // Update state in Redis

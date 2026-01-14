@@ -247,3 +247,52 @@ Run analytics & monitoring tests:
 ```bash
 node testAnalyticsMonitoring.js
 ```
+
+---
+
+## Optimization
+
+### Core Requirements
+
+- The current implementation uses 1 Redis call per check. Optimize to reduce Redis calls.
+- Support "unlimited" tier (no rate limiting) efficiently.
+- Add request "cost" - some endpoints count as multiple requests.
+
+### 1. Reduced Redis Calls via Local Caching
+
+**Without cache:** 50 requests = 50 Redis calls
+**With cache:** 50 requests = 1 Redis call (98% reduction)
+
+```javascript
+const limiter = new RateLimiter(redis, {
+  cacheEnabled: true,
+  cacheTTL: 1000, // 1 second cache
+});
+```
+
+### 2. Unlimited Tier (Zero Overhead)
+
+Bypass rate limiting for internal services and premium partners.
+
+```javascript
+await limiter.checkLimit('partner', '/api/search', 'unlimited', 'US');
+// Returns immediately: 0 Redis calls, 0ms processing
+```
+
+### 3. Request Cost (Multi-token Consumption)
+
+Different operations consume different token amounts.
+
+```javascript
+// Standard search (cost=1)
+await limiter.checkLimit(userId, '/api/search', 'free', 'US', 1);
+
+// Expensive checkout (cost=5)
+await limiter.checkLimit(userId, '/api/checkout', 'free', 'US', 5);
+```
+
+### Test Coverage
+
+```bash
+node testOptimizationChallenge.js
+```
